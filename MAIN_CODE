@@ -1,242 +1,242 @@
 /*
- * 아두이노 - ArUco 기반 PID 제어 정밀 주차
- * PID Library: https://github.com/br3ttb/Arduino-PID-Library
+ * ArUco 기반 자율주차 시스템 v1.0
+ * 4륜 구동 
+ * 
+ * 마커 ID: 천장(0-99), 벽면(100-149), 주차(150-199), 입구(200)
+ * 주차 공간: 홀수=빈칸, 짝수=점유
  */
 
 #include <ArduinoJson.h>
 #include <PID_v1.h>
 
-// 모터 핀
-#define MOTOR_LEFT_FWD  5
-#define MOTOR_LEFT_BWD  6
-#define MOTOR_RIGHT_FWD 9
-#define MOTOR_RIGHT_BWD 10
+// 모터 핀 (4륜: 좌측 전/후, 우측 전/후)
+#define LF_FWD 4   // 왼쪽 앞
+#define LF_BWD 5
+#define LB_FWD 6   // 왼쪽 뒤
+#define LB_BWD 7
+#define RF_FWD 8   // 오른쪽 앞
+#define RF_BWD 9
+#define RB_FWD 10  // 오른쪽 뒤
+#define RB_BWD 11
 
-// 변수
-int markerID = -1;
-int markerX = 0;
-int markerY = 0;
+// 시스템 상태
+enum State { IDLE, SEARCHING, PARKING, PARKED, EXITING };
+State state = IDLE;
 
-#define CENTER_X 320
-#define CENTER_Y 240
+// 카메라 중심
+const int CX = 320, CY = 240;
+
+// 허용 오차
+const int TOL_X = 15, TOL_Y = 15;
+const float TOL_ANGLE = 3.0;
+
+// 속도 설정
+const int SPD_SEARCH = 120, SPD_PARK = 100, SPD_EXIT = 100, SPD_TURN = 140;
+
+// 마커 데이터
+int mID = -1, mX = CX, mY = CY;
+float mAngle = 0;
+unsigned long lastRx = 0;
 
 // PID 변수
-double setpointX = CENTER_X;
-double inputX = CENTER_X;
-double outputX = 0;
+double setX = CX, inX = CX, outX = 0;
+double setY = CY, inY = CY, outY = 0;
+double setA = 0, inA = 0, outA = 0;
 
-double setpointY = CENTER_Y;
-double inputY = CENTER_Y;
-double outputY = 0;
-
-// PID 튜닝 파라미터
-double Kp_X = 2.0, Ki_X = 0.5, Kd_X = 1.0;
-double Kp_Y = 1.5, Ki_Y = 0.3, Kd_Y = 0.8;
-
-// PID 컨트롤러
-PID pidX(&inputX, &outputX, &setpointX, Kp_X, Ki_X, Kd_X, DIRECT);
-PID pidY(&inputY, &outputY, &setpointY, Kp_Y, Ki_Y, Kd_Y, DIRECT);
-
-#define TOLERANCE_X 20
-#define TOLERANCE_Y 20
+PID pidX(&inX, &outX, &setX, 1.2, 0.1, 0.5, DIRECT);
+PID pidY(&inY, &outY, &setY, 1.0, 0.08, 0.4, DIRECT);
+PID pidA(&inA, &outA, &setA, 3.0, 0.2, 1.0, DIRECT);
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   
-  pinMode(MOTOR_LEFT_FWD, OUTPUT);
-  pinMode(MOTOR_LEFT_BWD, OUTPUT);
-  pinMode(MOTOR_RIGHT_FWD, OUTPUT);
-  pinMode(MOTOR_RIGHT_BWD, OUTPUT);
+  int pins[] = {LF_FWD, LF_BWD, LB_FWD, LB_BWD, RF_FWD, RF_BWD, RB_FWD, RB_BWD};
+  for (int p : pins) pinMode(p, OUTPUT);
   
   pidX.SetMode(AUTOMATIC);
-  pidX.SetOutputLimits(-255, 255);
-  pidX.SetSampleTime(50);
-  
+  pidX.SetOutputLimits(-SPD_PARK, SPD_PARK);
   pidY.SetMode(AUTOMATIC);
-  pidY.SetOutputLimits(-255, 255);
-  pidY.SetSampleTime(50);
+  pidY.SetOutputLimits(-SPD_PARK, SPD_PARK);
+  pidA.SetMode(AUTOMATIC);
+  pidA.SetOutputLimits(-SPD_PARK, SPD_PARK);
   
-  Serial.println("PID Ready");
+  stop();
+  Serial.println("{\"status\":\"READY\"}");
 }
 
 void loop() {
-  if (Serial.available() > 0) {
-    String jsonString = Serial.readStringUntil('\n');
-    
-    StaticJsonDocument<200> doc;
-    DeserializationError error = deserializeJson(doc, jsonString);
-    
-    if (!error) {
-      markerID = doc["id"];
-      markerX = doc["x"];
-      markerY = doc["y"];
-      
-      controlByMarkerID(markerID, markerX, markerY);
-    }
+  processSerial();
+  
+  if (millis() - lastRx > 500) {
+    if (state == SEARCHING || state == EXITING) forward(80);
+    else if (state == PARKING) stop();
   }
+  delay(10);
 }
 
-void controlByMarkerID(int id, int x, int y) {
-  if (id >= 0 && id <= 99) {
-    followCeilingMarker(x);
-  } else if (id >= 100 && id <= 149) {
-    turnAtWall(id);
-  } else if (id >= 150 && id <= 199) {
-    if (id % 2 == 1) {
-      pidParkingControl(x, y);
-    } else {
-      moveForward(150);
-    }
-  } else if (id == 200) {
-    stopMotors();
-  }
-}
+// ==================== 시리얼 처리 ====================
 
-void pidParkingControl(int x, int y) {
-  inputX = x;
-  inputY = y;
+void processSerial() {
+  if (!Serial.available()) return;
   
-  int errorX = abs(x - CENTER_X);
-  int errorY = abs(y - CENTER_Y);
+  String json = Serial.readStringUntil('\n');
+  json.trim();
+  if (json.length() == 0) return;
   
-  if (errorX < TOLERANCE_X && errorY < TOLERANCE_Y) {
-    stopMotors();
-    Serial.println("PARKING ALIGNED!");
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, json)) return;
+  
+  lastRx = millis();
+  
+  if (doc.containsKey("cmd")) {
+    const char* cmd = doc["cmd"];
+    if (strcmp(cmd, "START") == 0) { state = SEARCHING; sendStatus("SEARCHING"); }
+    else if (strcmp(cmd, "EXIT") == 0 && state == PARKED) { state = EXITING; sendStatus("EXITING"); }
+    else if (strcmp(cmd, "STOP") == 0) { state = IDLE; stop(); sendStatus("STOPPED"); }
     return;
   }
   
-  pidX.Compute();
-  pidY.Compute();
-  
-  applyPIDToMotors(outputX, outputY);
-  
-  Serial.print("PID X:");
-  Serial.print(outputX);
-  Serial.print(" Y:");
-  Serial.print(outputY);
-  Serial.print(" Err X:");
-  Serial.print(errorX);
-  Serial.print(" Y:");
-  Serial.println(errorY);
+  if (doc.containsKey("id")) {
+    mID = doc["id"];
+    mX = doc["x"] | CX;
+    mY = doc["y"] | CY;
+    mAngle = doc["angle"] | 0.0;
+    updateState();
+  }
 }
 
-void applyPIDToMotors(double pidX, double pidY) {
-  int baseSpeed = 80;
+// ==================== 상태 머신 ====================
+
+void updateState() {
+  switch (state) {
+    case IDLE: stop(); break;
+    case SEARCHING: handleSearch(); break;
+    case PARKING: handleParking(); break;
+    case PARKED: stop(); break;
+    case EXITING: handleExit(); break;
+  }
+}
+
+void handleSearch() {
+  if (mID >= 0 && mID <= 99) followCeiling();
+  else if (mID >= 100 && mID <= 149) turnAtWall();
+  else if (mID >= 150 && mID <= 199) checkParkingSpot();
+  else if (mID == 200) followCeiling();
+}
+
+void handleParking() {
+  if (mID < 150 || mID > 199) return;
   
-  // Y축 우선 (전후)
-  if (abs(pidY) > 30) {
-    if (pidY > 0) {
-      int speed = constrain(abs(pidY), 60, 150);
-      analogWrite(MOTOR_LEFT_FWD, speed);
-      analogWrite(MOTOR_RIGHT_FWD, speed);
-      analogWrite(MOTOR_LEFT_BWD, 0);
-      analogWrite(MOTOR_RIGHT_BWD, 0);
-    } else {
-      int speed = constrain(abs(pidY), 60, 150);
-      analogWrite(MOTOR_LEFT_FWD, 0);
-      analogWrite(MOTOR_RIGHT_FWD, 0);
-      analogWrite(MOTOR_LEFT_BWD, speed);
-      analogWrite(MOTOR_RIGHT_BWD, speed);
-    }
+  inX = mX; inY = mY; inA = mAngle;
+  int errX = abs(mX - CX), errY = abs(mY - CY);
+  float errA = abs(mAngle);
+  
+  if (errX < TOL_X && errY < TOL_Y && errA < TOL_ANGLE) {
+    stop();
+    state = PARKED;
+    sendStatus("PARKING_COMPLETE");
     return;
   }
   
-  // X축 (좌우)
-  if (abs(pidX) > 20) {
-    if (pidX > 0) {
-      int speed = constrain(abs(pidX), 60, 120);
-      analogWrite(MOTOR_LEFT_FWD, speed);
-      analogWrite(MOTOR_RIGHT_FWD, 0);
-      analogWrite(MOTOR_LEFT_BWD, 0);
-      analogWrite(MOTOR_RIGHT_BWD, speed);
-    } else {
-      int speed = constrain(abs(pidX), 60, 120);
-      analogWrite(MOTOR_LEFT_FWD, 0);
-      analogWrite(MOTOR_RIGHT_FWD, speed);
-      analogWrite(MOTOR_LEFT_BWD, speed);
-      analogWrite(MOTOR_RIGHT_BWD, 0);
-    }
-    return;
-  }
+  pidX.Compute(); pidY.Compute(); pidA.Compute();
   
-  // 미세 조정
-  int leftSpeed = baseSpeed - (int)pidX;
-  int rightSpeed = baseSpeed + (int)pidX;
+  int left = 0, right = 0;
   
-  leftSpeed = constrain(leftSpeed, -120, 120);
-  rightSpeed = constrain(rightSpeed, -120, 120);
-  
-  if (leftSpeed >= 0) {
-    analogWrite(MOTOR_LEFT_FWD, leftSpeed);
-    analogWrite(MOTOR_LEFT_BWD, 0);
+  if (errA > TOL_ANGLE) {
+    left = -(int)outA; right = (int)outA;  // 제자리 회전
+  } else if (errY > TOL_Y) {
+    left = right = (int)outY;
   } else {
-    analogWrite(MOTOR_LEFT_FWD, 0);
-    analogWrite(MOTOR_LEFT_BWD, abs(leftSpeed));
+    left = SPD_PARK/2 - (int)outX;
+    right = SPD_PARK/2 + (int)outX;
   }
   
-  if (rightSpeed >= 0) {
-    analogWrite(MOTOR_RIGHT_FWD, rightSpeed);
-    analogWrite(MOTOR_RIGHT_BWD, 0);
+  drive(left, right);
+  sendDebug(errX, errY, errA);
+}
+
+void handleExit() {
+  if (mID == 200) {
+    stop();
+    state = IDLE;
+    sendStatus("EXIT_COMPLETE");
+  } else if (mID >= 0 && mID <= 99) {
+    followCeiling();
+  } else if (mID >= 100 && mID <= 149) {
+    turnAtWall();
+  } else if (mID >= 150 && mID <= 199) {
+    backward(SPD_EXIT);
+    delay(300);
+  }
+}
+
+// ==================== 주행 동작 ====================
+
+void followCeiling() {
+  int err = mX - CX;
+  int corr = err / 4;
+  drive(SPD_SEARCH + corr, SPD_SEARCH - corr);
+}
+
+void turnAtWall() {
+  stop(); delay(100);
+  
+  if (mID < 125) spinLeft(SPD_TURN);
+  else spinRight(SPD_TURN);
+  delay(450);  // 90도 회전 (튜닝 필요)
+  
+  stop(); delay(100);
+}
+
+void checkParkingSpot() {
+  if (mID % 2 == 0) {
+    forward(SPD_SEARCH);  // 점유 → 통과
   } else {
-    analogWrite(MOTOR_RIGHT_FWD, 0);
-    analogWrite(MOTOR_RIGHT_BWD, abs(rightSpeed));
+    state = PARKING;      // 빈칸 → 주차 시작
+    sendStatus("PARKING_STARTED");
   }
 }
 
-void followCeilingMarker(int x) {
-  int baseSpeed = 150;
-  int errorX = x - CENTER_X;
-  int correction = errorX / 3;
-  
-  int leftSpeed = baseSpeed + correction;
-  int rightSpeed = baseSpeed - correction;
-  
-  leftSpeed = constrain(leftSpeed, 0, 255);
-  rightSpeed = constrain(rightSpeed, 0, 255);
-  
-  analogWrite(MOTOR_LEFT_FWD, leftSpeed);
-  analogWrite(MOTOR_RIGHT_FWD, rightSpeed);
-  analogWrite(MOTOR_LEFT_BWD, 0);
-  analogWrite(MOTOR_RIGHT_BWD, 0);
-}
+// ==================== 모터 제어 ====================
 
-void turnAtWall(int wallID) {
-  if (wallID >= 100 && wallID < 125) {
-    turnLeft(500);
+void drive(int left, int right) {
+  left = constrain(left, -255, 255);
+  right = constrain(right, -255, 255);
+  
+  // 왼쪽 모터 (앞+뒤 동일)
+  if (left >= 0) {
+    analogWrite(LF_FWD, left); analogWrite(LF_BWD, 0);
+    analogWrite(LB_FWD, left); analogWrite(LB_BWD, 0);
   } else {
-    turnRight(500);
+    analogWrite(LF_FWD, 0); analogWrite(LF_BWD, -left);
+    analogWrite(LB_FWD, 0); analogWrite(LB_BWD, -left);
+  }
+  
+  // 오른쪽 모터 (앞+뒤 동일)
+  if (right >= 0) {
+    analogWrite(RF_FWD, right); analogWrite(RF_BWD, 0);
+    analogWrite(RB_FWD, right); analogWrite(RB_BWD, 0);
+  } else {
+    analogWrite(RF_FWD, 0); analogWrite(RF_BWD, -right);
+    analogWrite(RB_FWD, 0); analogWrite(RB_BWD, -right);
   }
 }
 
-void moveForward(int duration) {
-  analogWrite(MOTOR_LEFT_FWD, 150);
-  analogWrite(MOTOR_RIGHT_FWD, 150);
-  analogWrite(MOTOR_LEFT_BWD, 0);
-  analogWrite(MOTOR_RIGHT_BWD, 0);
-  delay(duration);
-}
+void forward(int spd)  { drive(spd, spd); } // 직진
+void backward(int spd) { drive(-spd, -spd); } // 후진
+void spinLeft(int spd) { drive(-spd, spd); }   // 제자리 좌회전
+void spinRight(int spd){ drive(spd, -spd); }   // 제자리 우회전
+void stop() { drive(0, 0); }
 
-void turnLeft(int duration) {
-  analogWrite(MOTOR_LEFT_FWD, 0);
-  analogWrite(MOTOR_RIGHT_FWD, 150);
-  analogWrite(MOTOR_LEFT_BWD, 150);
-  analogWrite(MOTOR_RIGHT_BWD, 0);
-  delay(duration);
-  stopMotors();
-}
+// ==================== 통신 ====================
 
-void turnRight(int duration) {
-  analogWrite(MOTOR_LEFT_FWD, 150);
-  analogWrite(MOTOR_RIGHT_FWD, 0);
-  analogWrite(MOTOR_LEFT_BWD, 0);
-  analogWrite(MOTOR_RIGHT_BWD, 150);
-  delay(duration);
-  stopMotors();
+void sendStatus(const char* s) {
+  Serial.print("{\"status\":\""); Serial.print(s); Serial.println("\"}");
 }
-
-void stopMotors() {
-  analogWrite(MOTOR_LEFT_FWD, 0);
-  analogWrite(MOTOR_RIGHT_FWD, 0);
-  analogWrite(MOTOR_LEFT_BWD, 0);
-  analogWrite(MOTOR_RIGHT_BWD, 0);
+// 디버
+void sendDebug(int ex, int ey, float ea) {
+  Serial.print("{\"eX\":"); Serial.print(ex);
+  Serial.print(",\"eY\":"); Serial.print(ey);
+  Serial.print(",\"eA\":"); Serial.print(ea);
+  Serial.println("}");
 }
