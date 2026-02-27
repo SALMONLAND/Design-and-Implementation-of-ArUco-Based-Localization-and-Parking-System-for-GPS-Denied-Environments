@@ -1,155 +1,236 @@
+"""
+ArUco 기반 자율주차 시스템 - 라즈베리파이 비전 모듈
+마커 ID: 천장(0-99), 벽면(100-149), 주차(150-199), 입구(200)
+"""
+
 import cv2
 import cv2.aruco as aruco
 import numpy as np
+import math
 
 # ArUco 설정
-aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
-parameters = aruco.DetectorParameters()
-detector = aruco.ArucoDetector(aruco_dict, parameters)
+ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
+ARUCO_PARAMS = aruco.DetectorParameters()
+DETECTOR = aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
 
-# 카메라 설정 (라즈베리파이)
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+# 카메라 설정
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+CX, CY = FRAME_WIDTH // 2, FRAME_HEIGHT // 2
+
+# 색상 범위 (HSV)
+COLOR_RANGES = {
+    'RED': [
+        (np.array([0, 100, 100]), np.array([10, 255, 255])),
+        (np.array([160, 100, 100]), np.array([180, 255, 255]))
+    ],
+    'GREEN': [
+        (np.array([40, 100, 100]), np.array([80, 255, 255]))
+    ],
+    'BLUE': [
+        (np.array([100, 100, 100]), np.array([130, 255, 255]))
+    ],
+    'WHITE': [
+        (np.array([0, 0, 200]), np.array([180, 30, 255]))
+    ]
+}
+
+MIN_COLOR_PIXELS = 500
 
 
-def detect_color(frame, roi=None):
-    """
-    색상 감지 함수 (흰색, 파란색, 빨간색)
-    roi: 관심영역 (x, y, w, h) - None이면 전체 프레임
-    반환: 'WHITE', 'BLUE', 'RED', None
-    """
-    if roi is not None:
-        x, y, w, h = roi
-        region = frame[y:y+h, x:x+w]
-    else:
-        # 프레임 중앙 영역 사용
-        h, w = frame.shape[:2]
-        cx, cy = w // 2, h // 2
-        size = 100
-        region = frame[cy-size:cy+size, cx-size:cx+size]
+class VisionSystem:
+    def __init__(self, camera_id=0):
+        self.cap = cv2.VideoCapture(camera_id)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        self.frame = None
     
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    def read_frame(self):
+        ret, self.frame = self.cap.read()
+        return ret
     
-    # 색상 범위 정의 (HSV)
-    color_ranges = {
-        'RED': [
-            (np.array([0, 100, 100]), np.array([10, 255, 255])),      # 빨간색 하단
-            (np.array([160, 100, 100]), np.array([180, 255, 255]))    # 빨간색 상단
-        ],
-        'BLUE': [
-            (np.array([100, 100, 100]), np.array([130, 255, 255]))
-        ],
-        'WHITE': [
-            (np.array([0, 0, 200]), np.array([180, 30, 255]))
-        ]
-    }
-    
-    max_pixels = 0
-    detected_color = None
-    
-    for color_name, ranges in color_ranges.items():
-        total_pixels = 0
-        for lower, upper in ranges:
-            mask = cv2.inRange(hsv, lower, upper)
-            total_pixels += cv2.countNonZero(mask)
+    def detect_marker(self):
+        """ArUco 마커 감지 → (id, x, y, angle) 또는 None"""
+        if self.frame is None:
+            return None
         
-        if total_pixels > max_pixels:
-            max_pixels = total_pixels
-            detected_color = color_name
+        gray = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = DETECTOR.detectMarkers(gray)
+        
+        if ids is None:
+            return None
+        
+        # 첫 번째 마커 처리
+        corner = corners[0][0]
+        marker_id = ids[0][0]
+        
+        # 중심점 계산
+        cx = int(np.mean(corner[:, 0]))
+        cy = int(np.mean(corner[:, 1]))
+        
+        # 각도 계산 (마커 상단 벡터 기준)
+        top_mid = (corner[0] + corner[1]) / 2
+        bottom_mid = (corner[2] + corner[3]) / 2
+        dx = top_mid[0] - bottom_mid[0]
+        dy = top_mid[1] - bottom_mid[1]
+        angle = math.degrees(math.atan2(dx, -dy))
+        
+        # 시각화
+        aruco.drawDetectedMarkers(self.frame, corners, ids)
+        cv2.circle(self.frame, (cx, cy), 5, (0, 255, 0), -1)
+        
+        return {
+            'id': int(marker_id),
+            'x': cx,
+            'y': cy,
+            'angle': round(angle, 2)
+        }
     
-    # 최소 픽셀 임계값 (노이즈 방지)
-    min_threshold = 500
-    if max_pixels < min_threshold:
+    def detect_color(self, roi=None):
+        """색상 감지 → 'RED', 'GREEN', 'BLUE', 'WHITE' 또는 None"""
+        if self.frame is None:
+            return None
+        
+        # ROI 설정 (기본: 중앙 200x200)
+        if roi:
+            x, y, w, h = roi
+            region = self.frame[y:y+h, x:x+w]
+        else:
+            region = self.frame[CY-100:CY+100, CX-100:CX+100]
+        
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        
+        max_pixels = 0
+        detected = None
+        
+        for color, ranges in COLOR_RANGES.items():
+            total = 0
+            for lower, upper in ranges:
+                mask = cv2.inRange(hsv, lower, upper)
+                total += cv2.countNonZero(mask)
+            
+            if total > max_pixels:
+                max_pixels = total
+                detected = color
+        
+        return detected if max_pixels >= MIN_COLOR_PIXELS else None
+    
+    def detect_parking_color(self, marker_data):
+        """주차 마커 주변 색상으로 점유 상태 확인"""
+        if marker_data is None:
+            return None
+        
+        x, y = marker_data['x'], marker_data['y']
+        
+        # 마커 아래쪽 영역 검사 (주차 공간)
+        roi_y = min(y + 30, FRAME_HEIGHT - 100)
+        roi = (x - 50, roi_y, 100, 80)
+        
+        color = self.detect_color(roi)
+        
+        # RED=점유, GREEN=빈칸
+        if color == 'RED':
+            return 'OCCUPIED'
+        elif color == 'GREEN':
+            return 'EMPTY'
         return None
     
-    return detected_color
-
-
-def detect_aruco_marker(frame):
-    """
-    ArUco 마커 감지 함수
-    반환: 마커 ID 리스트 또는 None
-    """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = detector.detectMarkers(gray)
+    def get_marker_type(self, marker_id):
+        """마커 ID로 타입 분류"""
+        if marker_id is None:
+            return None
+        if marker_id == 200:
+            return 'ENTRANCE'
+        if 0 <= marker_id <= 99:
+            return 'CEILING'
+        if 100 <= marker_id <= 149:
+            return 'WALL'
+        if 150 <= marker_id <= 199:
+            return 'PARKING'
+        return 'UNKNOWN'
     
-    if ids is not None:
-        aruco.drawDetectedMarkers(frame, corners, ids)
-        return [id[0] for id in ids]
+    def process(self):
+        """통합 처리 → 감지 결과 딕셔너리"""
+        if not self.read_frame():
+            return None
+        
+        marker = self.detect_marker()
+        color = self.detect_color()
+        
+        result = {
+            'marker': marker,
+            'color': color,
+            'type': None,
+            'parking_status': None
+        }
+        
+        if marker:
+            result['type'] = self.get_marker_type(marker['id'])
+            
+            # 주차 마커일 경우 색상으로 점유 상태 추가 확인
+            if result['type'] == 'PARKING':
+                result['parking_status'] = self.detect_parking_color(marker)
+        
+        return result
     
-    return None
-
-
-def detect(frame, mode='both'):
-    """
-    통합 감지 함수
-    mode: 'aruco', 'color', 'both'
-    반환: {'aruco_ids': [...], 'color': 'RED/BLUE/WHITE'}
-    """
-    result = {
-        'aruco_ids': None,
-        'color': None
-    }
+    def draw_overlay(self, result):
+        """화면에 정보 표시"""
+        if self.frame is None:
+            return
+        
+        # 중앙 십자선
+        cv2.line(self.frame, (CX-20, CY), (CX+20, CY), (255, 255, 0), 1)
+        cv2.line(self.frame, (CX, CY-20), (CX, CY+20), (255, 255, 0), 1)
+        
+        # ROI 영역
+        cv2.rectangle(self.frame, (CX-100, CY-100), (CX+100, CY+100), (100, 100, 100), 1)
+        
+        # 정보 텍스트
+        y = 30
+        if result['marker']:
+            m = result['marker']
+            text = f"ID:{m['id']} X:{m['x']} Y:{m['y']} A:{m['angle']}"
+            cv2.putText(self.frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            y += 25
+        
+        if result['type']:
+            cv2.putText(self.frame, f"Type: {result['type']}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            y += 25
+        
+        if result['color']:
+            cv2.putText(self.frame, f"Color: {result['color']}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            y += 25
+        
+        if result['parking_status']:
+            color = (0, 0, 255) if result['parking_status'] == 'OCCUPIED' else (0, 255, 0)
+            cv2.putText(self.frame, f"Parking: {result['parking_status']}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     
-    if mode in ['aruco', 'both']:
-        result['aruco_ids'] = detect_aruco_marker(frame)
+    def show(self):
+        cv2.imshow('Vision', self.frame)
+        return cv2.waitKey(1) & 0xFF
     
-    if mode in ['color', 'both']:
-        result['color'] = detect_color(frame)
-    
-    return result
+    def release(self):
+        self.cap.release()
+        cv2.destroyAllWindows()
 
 
-def get_detection():
-    """
-    단일 감지 수행 후 결과 반환
-    다른 모듈에서 호출용
-    """
-    ret, frame = cap.read()
-    if not ret:
-        return None
-    
-    return detect(frame, mode='both')
-
-
-# 메인 루프 (테스트/디버깅용)
+# 메인 실행
 if __name__ == "__main__":
-    print("ArUco & Color Detection Started")
-    print("Press 'q' to quit")
+    vision = VisionSystem(camera_id=0)
+    print("Vision System Started (Press 'q' to quit)")
     
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Camera read failed")
-            break
+        result = vision.process()
         
-        # 감지 수행
-        result = detect(frame, mode='both')
+        if result:
+            vision.draw_overlay(result)
+            
+            # 콘솔 출력 (디버그용)
+            if result['marker']:
+                print(f"Marker: {result['marker']} | Type: {result['type']} | Color: {result['color']}")
         
-        # 결과 표시
-        info_text = []
-        if result['aruco_ids']:
-            info_text.append(f"ID: {result['aruco_ids']}")
-        if result['color']:
-            info_text.append(f"Color: {result['color']}")
-        
-        # 화면에 정보 표시
-        y_pos = 30
-        for text in info_text:
-            cv2.putText(frame, text, (10, y_pos), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            y_pos += 30
-        
-        # 중앙 ROI 표시 (색상 감지 영역)
-        h, w = frame.shape[:2]
-        cx, cy = w // 2, h // 2
-        cv2.rectangle(frame, (cx-100, cy-100), (cx+100, cy+100), (255, 255, 0), 2)
-        
-        cv2.imshow('Detection', frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = vision.show()
+        if key == ord('q'):
             break
     
-    cap.release()
-    cv2.destroyAllWindows()
+    vision.release()
