@@ -1,0 +1,214 @@
+"""
+[디버그 5] 상태 머신 시뮬레이션 (모터 없음)
+────────────────────────────────────────
+카메라로 마커를 인식하면서 상태 전이를 시뮬레이션.
+모터는 구동하지 않고, 어떤 상태에서 어떤 마커를 만나면
+어떤 동작(전진/회전/주차 등)을 하는지 콘솔+화면에 표시.
+
+사용법: python3 debug_state_machine.py
+"""
+
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import math
+import time
+
+FRAME_W, FRAME_H = 640, 480
+CX, CY = FRAME_W // 2, FRAME_H // 2
+
+ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
+DETECTOR   = aruco.ArucoDetector(ARUCO_DICT, aruco.DetectorParameters())
+
+TOLERANCE_X, TOLERANCE_Y, TOLERANCE_A = 20, 20, 3.0
+
+
+def classify(mid):
+    if mid == 200:             return 'ENTRANCE'
+    if 0   <= mid <= 99:       return 'CEILING'
+    if 100 <= mid <= 124:      return 'WALL_LEFT'
+    if 125 <= mid <= 149:      return 'WALL_RIGHT'
+    if 150 <= mid <= 199:
+        return 'PARKING_EMPTY' if mid % 2 == 1 else 'PARKING_OCCUPIED'
+    return 'UNKNOWN'
+
+
+class StateMachineDebug:
+    """모터 없이 상태 전이만 추적"""
+
+    STATES = ['IDLE', 'SEARCHING', 'PARKING', 'PARKED', 'EXITING']
+
+    def __init__(self):
+        self.state = 'IDLE'
+        self.transition_log = []    # (시간, 이전상태, 새상태, 이유)
+        self.motor_action = "정지"  # 가상 모터 동작
+
+    def transition(self, new_state, reason=""):
+        if new_state != self.state:
+            entry = (time.strftime("%H:%M:%S"), self.state, new_state, reason)
+            self.transition_log.append(entry)
+            print(f"  ▶ 전이: {self.state} → {new_state}  ({reason})")
+            self.state = new_state
+
+    def process(self, marker):
+        """상태별 로직 (모터 대신 문자열 출력)"""
+
+        if self.state == 'IDLE':
+            self.motor_action = "정지"
+            return
+
+        if marker is None:
+            self.motor_action = "저속 전진 (마커 미감지)"
+            return
+
+        t = marker['type']
+        ex = marker['x'] - CX
+        ey = marker['y'] - CY
+        ea = marker['angle']
+
+        if self.state == 'SEARCHING':
+            if t == 'CEILING':
+                if abs(ex) < TOLERANCE_X:
+                    self.motor_action = "직진"
+                elif ex > 0:
+                    self.motor_action = "우보정 (좌전진)"
+                else:
+                    self.motor_action = "좌보정 (우전진)"
+
+            elif t == 'WALL_LEFT':
+                self.motor_action = "좌회전 실행"
+
+            elif t == 'WALL_RIGHT':
+                self.motor_action = "우회전 실행"
+
+            elif t == 'PARKING_EMPTY':
+                self.transition('PARKING', f"빈 주차 ID:{marker['id']}")
+                self.motor_action = "PID 정렬 시작"
+
+            elif t == 'PARKING_OCCUPIED':
+                self.motor_action = "통과 (점유)"
+
+            elif t == 'ENTRANCE':
+                self.motor_action = "입구 통과"
+
+        elif self.state == 'PARKING':
+            converged = (abs(ex) < TOLERANCE_X and
+                         abs(ey) < TOLERANCE_Y and
+                         abs(ea) < TOLERANCE_A)
+            if converged:
+                self.transition('PARKED', '정렬 완료')
+                self.motor_action = "정지 (주차 완료)"
+            elif abs(ea) > TOLERANCE_A:
+                self.motor_action = f"각도 보정 (eA={ea:+.1f}°)"
+            elif abs(ey) > TOLERANCE_Y:
+                self.motor_action = f"Y축 보정 (eY={ey:+d})"
+            else:
+                self.motor_action = f"X축 보정 (eX={ex:+d})"
+
+        elif self.state == 'PARKED':
+            self.motor_action = "정지 (대기)"
+
+        elif self.state == 'EXITING':
+            if t == 'ENTRANCE':
+                self.transition('IDLE', '입구 도착')
+                self.motor_action = "정지"
+            elif t == 'CEILING':
+                self.motor_action = "경로 추종"
+            elif t in ('WALL_LEFT', 'WALL_RIGHT'):
+                self.motor_action = f"{'좌' if t == 'WALL_LEFT' else '우'}회전"
+            else:
+                self.motor_action = "전진"
+
+
+# ── 메인 ──
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+
+sm = StateMachineDebug()
+
+print("=" * 55)
+print("  상태 머신 디버그 (모터 미구동)")
+print("  s=탐색  e=출차  x=정지  q=종료")
+print("=" * 55)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = DETECTOR.detectMarkers(gray)
+
+    marker = None
+    if ids is not None:
+        aruco.drawDetectedMarkers(frame, corners, ids)
+        c = corners[0][0]
+        mt = (c[0]+c[1])/2;  mb = (c[2]+c[3])/2
+        marker = {
+            'id':    int(ids[0][0]),
+            'x':     int(np.mean(c[:,0])),
+            'y':     int(np.mean(c[:,1])),
+            'angle': round(math.degrees(math.atan2(mt[0]-mb[0], -(mt[1]-mb[1]))), 2),
+        }
+        marker['type'] = classify(marker['id'])
+
+    sm.process(marker)
+
+    # ── HUD ──
+    cv2.line(frame, (CX-20, CY), (CX+20, CY), (255,255,0), 1)
+    cv2.line(frame, (CX, CY-20), (CX, CY+20), (255,255,0), 1)
+
+    # 상태 표시
+    state_colors = {
+        'IDLE': (150,150,150), 'SEARCHING': (0,200,255),
+        'PARKING': (0,255,255), 'PARKED': (0,255,0), 'EXITING': (255,100,0),
+    }
+    color = state_colors.get(sm.state, (255,255,255))
+    cv2.putText(frame, f"STATE: {sm.state}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    cv2.putText(frame, f"Action: {sm.motor_action}", (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 0), 1)
+
+    if marker:
+        txt = (f"ID:{marker['id']}({marker['type']})  "
+               f"err=({marker['x']-CX:+d},{marker['y']-CY:+d})  "
+               f"angle={marker['angle']:+.1f}°")
+        cv2.putText(frame, txt, (10, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+
+    # 전이 로그 (최근 5개)
+    y = FRAME_H - 15
+    for entry in sm.transition_log[-5:]:
+        log_txt = f"{entry[0]}  {entry[1]}→{entry[2]}  {entry[3]}"
+        cv2.putText(frame, log_txt, (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+        y -= 18
+
+    # 상태 다이어그램 (간이)
+    sx = FRAME_W - 200
+    for i, s in enumerate(sm.STATES):
+        sy = 30 + i * 25
+        c = (0, 255, 0) if s == sm.state else (100, 100, 100)
+        prefix = "▶ " if s == sm.state else "  "
+        cv2.putText(frame, f"{prefix}{s}", (sx, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1)
+
+    cv2.imshow('State Machine Debug', frame)
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('q'):
+        break
+    elif key == ord('s') and sm.state == 'IDLE':
+        sm.transition('SEARCHING', '사용자 명령')
+    elif key == ord('e') and sm.state == 'PARKED':
+        sm.transition('EXITING', '사용자 출차 명령')
+    elif key == ord('x'):
+        sm.transition('IDLE', '긴급 정지')
+
+cap.release()
+cv2.destroyAllWindows()
+print("\n>>> 전이 로그:")
+for entry in sm.transition_log:
+    print(f"  {entry[0]}  {entry[1]:12s} → {entry[2]:12s}  ({entry[3]})")
+print(">>> 상태 머신 디버그 종료")
