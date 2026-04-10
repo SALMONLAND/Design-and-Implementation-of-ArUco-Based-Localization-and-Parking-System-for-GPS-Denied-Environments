@@ -1,0 +1,52 @@
+"""
+[디버그 6] GPIO 핀 개별 테스트
+──────────────────────────
+각 핀을 하나씩 켜고 끄면서 어떤 모터가 어느 방향으로
+도는지 확인. 배선 오류를 잡는 데 사용.
+
+사용법: python3 debug_gpio_pin.py
+"""
+
+import lgpio
+import time
+import signal
+import sys
+
+GPIOCHIP = 4
+PINS = {
+    17: "좌측 전방 모터 - 전진 (LEFT_FWD_A)",
+    27: "좌측 전방 모터 - 후진 (LEFT_REV_A)",
+    22: "좌측 후방 모터 - 전진 (LEFT_FWD_B)",
+    23: "좌측 후방 모터 - 후진 (LEFT_REV_B)",
+    24: "우측 전방 모터 - 전진 (RIGHT_FWD_A)",
+    25: "우측 전방 모터 - 후진 (RIGHT_REV_A)",
+     5: "우측 후방 모터 - 전진 (RIGHT_FWD_B)",
+     6: "우측 후방 모터 - 후진 (RIGHT_REV_B)",
+}
+
+h = lgpio.gpiochip_open(GPIOCHIP)
+for p in PINS:
+    lgpio.gpio_claim_output(h, p, 0)
+
+def cleanup(*_):
+    for p in PINS: lgpio.gpio_write(h, p, 0)
+    lgpio.gpiochip_close(h)
+    sys.exit(0)
+signal.signal(signal.SIGINT, cleanup)
+
+print("=" * 55)
+print("  GPIO 핀 개별 테스트")
+print("  각 핀을 1초간 HIGH로 설정합니다.")
+print("  어떤 모터가 어느 방향으로 도는지 확인하세요.")
+print("=" * 55)
+
+for pin, desc in PINS.items():
+    input(f"\n  [Enter] GPIO {pin:2d} → {desc}")
+    lgpio.gpio_write(h, pin, 1)
+    print(f"    GPIO {pin} = HIGH (1초)")
+    time.sleep(1.0)
+    lgpio.gpio_write(h, pin, 0)
+    print(f"    GPIO {pin} = LOW")
+
+print("\n>>> 핀 테스트 완료")
+cleanup()
