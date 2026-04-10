@@ -1,0 +1,269 @@
+"""
+[디버그 4] PID 제어 튜닝
+──────────────────────
+주차 마커(ID 150~199) 앞에 차량을 놓고 실행.
+PID 출력값, 오차 수렴 과정을 실시간 콘솔 + 화면 그래프로 표시.
+모터를 실제로 구동하므로 차량이 움직입니다.
+
+사용법:
+  python3 debug_pid.py
+  → 주차 마커가 보이면 자동으로 정렬 시작
+  → 스페이스: 모터 ON/OFF 토글
+  → 1/2/3: Kp 미세 조정 (X/Y/Angle)
+"""
+
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import lgpio
+import math
+import time
+import signal
+import sys
+
+# ── 설정 ──
+GPIOCHIP = 4
+LFA, LRA = 17, 27;  LFB, LRB = 22, 23
+RFA, RRA = 24, 25;  RFB, RRB =  5,  6
+ALL_PINS = [LFA, LRA, LFB, LRB, RFA, RRA, RFB, RRB]
+
+FRAME_W, FRAME_H = 640, 480
+CX, CY = FRAME_W // 2, FRAME_H // 2
+
+ARUCO_DICT   = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
+DETECTOR     = aruco.ArucoDetector(ARUCO_DICT, aruco.DetectorParameters())
+
+TOLERANCE_X, TOLERANCE_Y, TOLERANCE_A = 20, 20, 3.0
+
+
+# ── PID ──
+class PID:
+    def __init__(self, kp, ki, kd, name=""):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.name = name
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.history = []       # (time, error, output) 로그
+
+    def update(self, error, dt=0.033):
+        self.integral += error * dt
+        deriv = (error - self.prev_error) / dt if dt > 0 else 0
+        self.prev_error = error
+        out = self.kp * error + self.ki * self.integral + self.kd * deriv
+        out = max(-1.0, min(1.0, out))
+        self.history.append((time.time(), error, out))
+        if len(self.history) > 300:
+            self.history.pop(0)
+        return out
+
+    def reset(self):
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.history.clear()
+
+
+pid_x = PID(1.2, 0.1, 0.5, "X")
+pid_y = PID(1.0, 0.08, 0.4, "Y")
+pid_a = PID(3.0, 0.2, 1.0, "Angle")
+
+
+# ── 모터 ──
+h = lgpio.gpiochip_open(GPIOCHIP)
+for p in ALL_PINS:
+    lgpio.gpio_claim_output(h, p, 0)
+
+def cleanup(*_):
+    for p in ALL_PINS: lgpio.gpio_write(h, p, 0)
+    lgpio.gpiochip_close(h)
+    sys.exit(0)
+signal.signal(signal.SIGINT, cleanup)
+
+def left(d):
+    lgpio.gpio_write(h, LFA, max(d,0));  lgpio.gpio_write(h, LRA, max(-d,0))
+    lgpio.gpio_write(h, LFB, max(d,0));  lgpio.gpio_write(h, LRB, max(-d,0))
+def right(d):
+    lgpio.gpio_write(h, RFA, max(d,0));  lgpio.gpio_write(h, RRA, max(-d,0))
+    lgpio.gpio_write(h, RFB, max(d,0));  lgpio.gpio_write(h, RRB, max(-d,0))
+def stop():
+    left(0); right(0)
+
+
+# ── 그래프 그리기 ──
+def draw_graph(frame, pid, x_offset, y_offset, w=190, h_px=80):
+    """PID 히스토리를 미니 그래프로 표시"""
+    cv2.rectangle(frame, (x_offset, y_offset), (x_offset+w, y_offset+h_px), (30,30,30), -1)
+    cv2.rectangle(frame, (x_offset, y_offset), (x_offset+w, y_offset+h_px), (80,80,80), 1)
+
+    # 제목
+    cv2.putText(frame, f"{pid.name} Kp={pid.kp:.2f} Ki={pid.ki:.2f} Kd={pid.kd:.2f}",
+                (x_offset+3, y_offset+12), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200,200,200), 1)
+
+    if len(pid.history) < 2:
+        return
+
+    # 0선
+    mid_y = y_offset + h_px // 2
+    cv2.line(frame, (x_offset, mid_y), (x_offset+w, mid_y), (60,60,60), 1)
+
+    # 오차 그래프 (녹색) + 출력 그래프 (노랑)
+    errors  = [e for _, e, _ in pid.history[-w:]]
+    outputs = [o for _, _, o in pid.history[-w:]]
+
+    max_e = max(abs(e) for e in errors) if errors else 1
+    max_e = max(max_e, 1)
+    scale = (h_px // 2 - 5) / max_e
+
+    for i in range(1, len(errors)):
+        x1 = x_offset + i - 1
+        x2 = x_offset + i
+        # 오차 (녹색)
+        y1 = int(mid_y - errors[i-1] * scale)
+        y2 = int(mid_y - errors[i] * scale)
+        cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+        # 출력 (노랑)
+        o_scale = (h_px // 2 - 5)
+        y1o = int(mid_y - outputs[i-1] * o_scale)
+        y2o = int(mid_y - outputs[i] * o_scale)
+        cv2.line(frame, (x1, y1o), (x2, y2o), (0, 255, 255), 1)
+
+    # 현재값
+    cv2.putText(frame, f"err={errors[-1]:+.1f} out={outputs[-1]:+.2f}",
+                (x_offset+3, y_offset+h_px-5), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (150,255,150), 1)
+
+
+# ── 메인 ──
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+
+motor_enabled = False
+converged = False
+
+print("=" * 55)
+print("  PID 튜닝 디버그")
+print("  SPACE=모터토글  1/2/3=Kp±0.1(X/Y/A)")
+print("  +/-=선택축 Kp 증감  r=PID리셋  q=종료")
+print("=" * 55)
+
+selected_pid = pid_a   # 기본 선택: 각도
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = DETECTOR.detectMarkers(gray)
+
+    marker = None
+    if ids is not None:
+        aruco.drawDetectedMarkers(frame, corners, ids)
+        c = corners[0][0]
+        mid_t = (c[0] + c[1]) / 2
+        mid_b = (c[2] + c[3]) / 2
+        marker = {
+            'id': int(ids[0][0]),
+            'x':  int(np.mean(c[:, 0])),
+            'y':  int(np.mean(c[:, 1])),
+            'angle': round(math.degrees(math.atan2(
+                mid_t[0]-mid_b[0], -(mid_t[1]-mid_b[1]))), 2),
+        }
+
+    # ── PID 제어 ──
+    if marker:
+        ex = marker['x'] - CX
+        ey = marker['y'] - CY
+        ea = marker['angle']
+
+        out_a = pid_a.update(ea)
+        out_y = pid_y.update(ey)
+        out_x = pid_x.update(ex)
+
+        converged = (abs(ex) < TOLERANCE_X and
+                     abs(ey) < TOLERANCE_Y and
+                     abs(ea) < TOLERANCE_A)
+
+        if motor_enabled and not converged:
+            # 우선순위: 각도 → Y → X
+            if abs(ea) > TOLERANCE_A:
+                if out_a > 0: left(-1); right(1)
+                else:         left(1);  right(-1)
+            elif abs(ey) > TOLERANCE_Y:
+                if out_y > 0: left(-1); right(-1)
+                else:         left(1);  right(1)
+            else:
+                if out_x > 0: left(1);  right(-1)
+                else:         left(-1); right(1)
+        else:
+            stop()
+
+        # 콘솔 로그 (10프레임마다)
+        if int(time.time() * 10) % 3 == 0:
+            status = "✓ CONVERGED" if converged else "  adjusting"
+            print(f"  eX={ex:+4d}  eY={ey:+4d}  eA={ea:+7.2f}°  "
+                  f"outX={out_x:+.2f}  outY={out_y:+.2f}  outA={out_a:+.2f}  {status}")
+    else:
+        stop()
+
+    # ── HUD ──
+    cv2.line(frame, (CX-20, CY), (CX+20, CY), (255,255,0), 1)
+    cv2.line(frame, (CX, CY-20), (CX, CY+20), (255,255,0), 1)
+
+    # 마커→중심 오차선
+    if marker:
+        cv2.line(frame, (CX, CY), (marker['x'], marker['y']), (0, 100, 255), 2)
+        cv2.circle(frame, (marker['x'], marker['y']), 6, (0, 255, 0), -1)
+
+    # 상태
+    motor_txt = "MOTOR: ON" if motor_enabled else "MOTOR: OFF"
+    color = (0, 255, 0) if motor_enabled else (0, 0, 255)
+    cv2.putText(frame, motor_txt, (FRAME_W - 150, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    if converged:
+        cv2.putText(frame, "CONVERGED", (FRAME_W//2-60, FRAME_H-20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    sel_txt = f"Selected: {selected_pid.name} (Kp={selected_pid.kp:.2f})"
+    cv2.putText(frame, sel_txt, (10, FRAME_H-10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 0), 1)
+
+    # 미니 그래프 3개
+    draw_graph(frame, pid_a, 5,   FRAME_H - 210)
+    draw_graph(frame, pid_y, 205, FRAME_H - 210)
+    draw_graph(frame, pid_x, 405, FRAME_H - 210)
+
+    # ── 키 입력 ──
+    cv2.imshow('PID Debug', frame)
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('q'):
+        break
+    elif key == ord(' '):
+        motor_enabled = not motor_enabled
+        if not motor_enabled:
+            stop()
+        print(f"  모터 {'ON' if motor_enabled else 'OFF'}")
+    elif key == ord('1'):
+        selected_pid = pid_x
+        print(f"  선택: X축 (Kp={pid_x.kp:.2f})")
+    elif key == ord('2'):
+        selected_pid = pid_y
+        print(f"  선택: Y축 (Kp={pid_y.kp:.2f})")
+    elif key == ord('3'):
+        selected_pid = pid_a
+        print(f"  선택: Angle (Kp={pid_a.kp:.2f})")
+    elif key == ord('+') or key == ord('='):
+        selected_pid.kp += 0.1
+        print(f"  {selected_pid.name} Kp → {selected_pid.kp:.2f}")
+    elif key == ord('-'):
+        selected_pid.kp = max(0.1, selected_pid.kp - 0.1)
+        print(f"  {selected_pid.name} Kp → {selected_pid.kp:.2f}")
+    elif key == ord('r'):
+        pid_x.reset(); pid_y.reset(); pid_a.reset()
+        print("  PID 리셋 완료")
+
+stop()
+cap.release()
+cv2.destroyAllWindows()
+cleanup()
