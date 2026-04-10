@@ -1,0 +1,87 @@
+"""
+[디버그 1] 모터 기본 동작 테스트
+─────────────────────────────
+4개 모터의 전진/후진/좌회전/우회전/개별 구동을 순차 확인.
+각 동작마다 방향·시간을 콘솔에 출력하므로
+모터 배선이 올바른지, 회전 방향이 맞는지 육안 확인용.
+
+사용법: python3 debug_motor_basic.py
+"""
+
+import lgpio
+import time
+import signal
+import sys
+
+# ── GPIO 설정 (main.py와 동일) ──
+GPIOCHIP = 4
+LEFT_FWD_A, LEFT_REV_A   = 17, 27
+LEFT_FWD_B, LEFT_REV_B   = 22, 23
+RIGHT_FWD_A, RIGHT_REV_A = 24, 25
+RIGHT_FWD_B, RIGHT_REV_B =  5,  6
+ALL_PINS = [
+    LEFT_FWD_A, LEFT_REV_A, LEFT_FWD_B, LEFT_REV_B,
+    RIGHT_FWD_A, RIGHT_REV_A, RIGHT_FWD_B, RIGHT_REV_B,
+]
+
+h = lgpio.gpiochip_open(GPIOCHIP)
+for p in ALL_PINS:
+    lgpio.gpio_claim_output(h, p, 0)
+
+
+def cleanup(*_):
+    for p in ALL_PINS:
+        lgpio.gpio_write(h, p, 0)
+    lgpio.gpiochip_close(h)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup)
+
+
+def left(d):
+    lgpio.gpio_write(h, LEFT_FWD_A,  max( d, 0))
+    lgpio.gpio_write(h, LEFT_REV_A,  max(-d, 0))
+    lgpio.gpio_write(h, LEFT_FWD_B,  max( d, 0))
+    lgpio.gpio_write(h, LEFT_REV_B,  max(-d, 0))
+
+def right(d):
+    lgpio.gpio_write(h, RIGHT_FWD_A, max( d, 0))
+    lgpio.gpio_write(h, RIGHT_REV_A, max(-d, 0))
+    lgpio.gpio_write(h, RIGHT_FWD_B, max( d, 0))
+    lgpio.gpio_write(h, RIGHT_REV_B, max(-d, 0))
+
+def stop():
+    left(0); right(0)
+
+def run_action(name, l, r, duration):
+    print(f"  {name:16s}  L={l:+d}  R={r:+d}  ({duration}s)")
+    left(l); right(r)
+    time.sleep(duration)
+    stop()
+    time.sleep(0.5)
+
+
+# ── 테스트 시퀀스 ──
+print("=" * 50)
+print("  모터 기본 동작 테스트")
+print("  Ctrl+C 로 중단")
+print("=" * 50)
+
+DURATION = 1.5  # 각 동작 시간 (초) — 필요시 조정
+
+tests = [
+    ("전진",         1,  1),
+    ("후진",        -1, -1),
+    ("제자리 좌회전", -1,  1),
+    ("제자리 우회전",  1, -1),
+    ("좌측만 전진",   1,  0),
+    ("우측만 전진",   0,  1),
+    ("좌측만 후진",  -1,  0),
+    ("우측만 후진",   0, -1),
+]
+
+for name, l, r in tests:
+    run_action(name, l, r, DURATION)
+
+print("\n>>> 모터 테스트 완료")
+cleanup()
