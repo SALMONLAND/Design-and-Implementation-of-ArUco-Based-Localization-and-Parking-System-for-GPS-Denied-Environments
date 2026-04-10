@@ -1,0 +1,192 @@
+"""
+[디버그 3] 비전 시스템 — ArUco 마커 & 색상 감지
+──────────────────────────────────────────────
+모터 없이 카메라만 사용. 마커 ID, 좌표, 각도, 타입, 색상을
+실시간으로 화면과 콘솔에 출력하여 비전 파이프라인을 검증.
+
+사용법: python3 debug_vision.py
+"""
+
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import math
+import time
+
+# ── 설정 (main.py 동일) ──
+FRAME_WIDTH, FRAME_HEIGHT = 640, 480
+CX, CY = FRAME_WIDTH // 2, FRAME_HEIGHT // 2
+
+ARUCO_DICT   = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
+ARUCO_PARAMS = aruco.DetectorParameters()
+DETECTOR     = aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
+
+COLOR_RANGES = {
+    'RED': [
+        (np.array([0,100,100]),   np.array([10,255,255])),
+        (np.array([160,100,100]), np.array([180,255,255])),
+    ],
+    'GREEN': [(np.array([40,100,100]),  np.array([80,255,255]))],
+    'BLUE':  [(np.array([100,100,100]), np.array([130,255,255]))],
+    'WHITE': [(np.array([0,0,200]),     np.array([180,30,255]))],
+}
+MIN_COLOR_PIXELS = 500
+
+
+def classify_marker(mid):
+    if mid == 200:             return 'ENTRANCE'
+    if 0   <= mid <= 99:       return 'CEILING'
+    if 100 <= mid <= 124:      return 'WALL_LEFT'
+    if 125 <= mid <= 149:      return 'WALL_RIGHT'
+    if 150 <= mid <= 199:
+        return 'PARKING_EMPTY' if mid % 2 == 1 else 'PARKING_OCCUPIED'
+    return 'UNKNOWN'
+
+
+# ── 카메라 열기 ──
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+print("=" * 55)
+print("  비전 디버그 (마커 + 색상)")
+print("  q=종료  c=색상맵 토글  m=다중마커 토글")
+print("=" * 55)
+
+show_color_map = False
+show_all_markers = False
+frame_count = 0
+fps_time = time.time()
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    frame_count += 1
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, rejected = DETECTOR.detectMarkers(gray)
+
+    # ── 마커 감지 ──
+    detected_markers = []
+    if ids is not None:
+        aruco.drawDetectedMarkers(frame, corners, ids)
+        limit = len(ids) if show_all_markers else 1
+        for i in range(limit):
+            c = corners[i][0]
+            mid_top    = (c[0] + c[1]) / 2
+            mid_bottom = (c[2] + c[3]) / 2
+            dx = mid_top[0] - mid_bottom[0]
+            dy = mid_top[1] - mid_bottom[1]
+
+            m = {
+                'id':    int(ids[i][0]),
+                'x':     int(np.mean(c[:, 0])),
+                'y':     int(np.mean(c[:, 1])),
+                'angle': round(math.degrees(math.atan2(dx, -dy)), 2),
+            }
+            m['type'] = classify_marker(m['id'])
+            m['error_x'] = m['x'] - CX
+            m['error_y'] = m['y'] - CY
+            detected_markers.append(m)
+
+            # 마커 중심 + 오차선
+            cv2.circle(frame, (m['x'], m['y']), 5, (0, 255, 0), -1)
+            cv2.line(frame, (CX, CY), (m['x'], m['y']), (0, 100, 255), 1)
+
+    # ── 색상 감지 ──
+    roi = frame[CY-100:CY+100, CX-100:CX+100]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    best_count, best_color = 0, None
+    color_counts = {}
+    for color, ranges in COLOR_RANGES.items():
+        total = sum(cv2.countNonZero(cv2.inRange(hsv, lo, hi)) for lo, hi in ranges)
+        color_counts[color] = total
+        if total > best_count:
+            best_count, best_color = total, color
+    detected_color = best_color if best_count >= MIN_COLOR_PIXELS else None
+
+    # ── 색상맵 표시 ──
+    if show_color_map:
+        hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        overlay = np.zeros_like(frame)
+        colors_bgr = {'RED': (0,0,255), 'GREEN': (0,255,0), 'BLUE': (255,0,0), 'WHITE': (200,200,200)}
+        for color, ranges in COLOR_RANGES.items():
+            mask = np.zeros(hsv_full.shape[:2], dtype=np.uint8)
+            for lo, hi in ranges:
+                mask |= cv2.inRange(hsv_full, lo, hi)
+            overlay[mask > 0] = colors_bgr.get(color, (128,128,128))
+        frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+
+    # ── HUD ──
+    cv2.line(frame, (CX-20, CY), (CX+20, CY), (255, 255, 0), 1)
+    cv2.line(frame, (CX, CY-20), (CX, CY+20), (255, 255, 0), 1)
+    cv2.rectangle(frame, (CX-100, CY-100), (CX+100, CY+100), (100, 100, 100), 1)
+
+    y = 25
+    # FPS
+    if frame_count % 30 == 0:
+        now = time.time()
+        fps = 30 / (now - fps_time) if now != fps_time else 0
+        fps_time = now
+    else:
+        fps = 0
+    if fps > 0:
+        cv2.putText(frame, f"FPS: {fps:.0f}", (FRAME_WIDTH - 100, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    # 마커 정보
+    for m in detected_markers:
+        txt = (f"ID:{m['id']}({m['type']})  "
+               f"pos=({m['x']},{m['y']})  "
+               f"err=({m['error_x']:+d},{m['error_y']:+d})  "
+               f"angle={m['angle']}")
+        cv2.putText(frame, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+        y += 20
+
+    # 색상 정보
+    if detected_color:
+        cv2.putText(frame, f"Color: {detected_color} ({best_count}px)",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+        y += 20
+
+    # 색상 히스토그램 (간이)
+    for color, cnt in color_counts.items():
+        bar = int(cnt / 200)
+        cv2.putText(frame, f"  {color:6s}: {cnt:5d} {'█'*min(bar,30)}",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+        y += 15
+
+    if not ids is None:
+        cv2.putText(frame, f"Markers: {len(ids)}", (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 200), 1)
+        y += 18
+
+    mode_txt = f"[ColorMap:{'ON' if show_color_map else 'OFF'}] [MultiMarker:{'ON' if show_all_markers else 'OFF'}]"
+    cv2.putText(frame, mode_txt, (10, FRAME_HEIGHT - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+
+    # ── 콘솔 출력 (매 30프레임) ──
+    if frame_count % 30 == 0 and detected_markers:
+        for m in detected_markers:
+            print(f"  ID:{m['id']:3d}  type={m['type']:18s}  "
+                  f"pos=({m['x']:3d},{m['y']:3d})  "
+                  f"err=({m['error_x']:+4d},{m['error_y']:+4d})  "
+                  f"angle={m['angle']:+7.2f}°  "
+                  f"color={detected_color}")
+
+    # ── 키 입력 ──
+    cv2.imshow('Vision Debug', frame)
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('c'):
+        show_color_map = not show_color_map
+        print(f"  색상맵 {'ON' if show_color_map else 'OFF'}")
+    elif key == ord('m'):
+        show_all_markers = not show_all_markers
+        print(f"  다중마커 {'ON' if show_all_markers else 'OFF'}")
+
+cap.release()
+cv2.destroyAllWindows()
+print(">>> 비전 디버그 종료")
