@@ -1,0 +1,118 @@
+"""
+[디버그 2] 모터 이동 거리 · 회전 각도 캘리브레이션
+──────────────────────────────────────────────
+전진/후진 시간 vs 실제 이동 거리, 회전 시간 vs 실제 각도를 측정하여
+main.py의 TURN_DURATION, EXIT_REVERSE_T 등 상수를 교정하는 데 사용.
+
+사용법:
+  python3 debug_motor_distance.py
+  → 메뉴 선택 후 줄자/각도기로 실측
+"""
+
+import lgpio
+import time
+import signal
+import sys
+
+# ── GPIO (main.py 동일) ──
+GPIOCHIP = 4
+LFA, LRA = 17, 27;  LFB, LRB = 22, 23
+RFA, RRA = 24, 25;  RFB, RRB =  5,  6
+ALL = [LFA, LRA, LFB, LRB, RFA, RRA, RFB, RRB]
+
+h = lgpio.gpiochip_open(GPIOCHIP)
+for p in ALL:
+    lgpio.gpio_claim_output(h, p, 0)
+
+def cleanup(*_):
+    for p in ALL: lgpio.gpio_write(h, p, 0)
+    lgpio.gpiochip_close(h)
+    sys.exit(0)
+signal.signal(signal.SIGINT, cleanup)
+
+def left(d):
+    lgpio.gpio_write(h, LFA, max(d,0));  lgpio.gpio_write(h, LRA, max(-d,0))
+    lgpio.gpio_write(h, LFB, max(d,0));  lgpio.gpio_write(h, LRB, max(-d,0))
+def right(d):
+    lgpio.gpio_write(h, RFA, max(d,0));  lgpio.gpio_write(h, RRA, max(-d,0))
+    lgpio.gpio_write(h, RFB, max(d,0));  lgpio.gpio_write(h, RRB, max(-d,0))
+def stop():
+    left(0); right(0)
+
+
+def test_straight(duration):
+    """직진 테스트 → 이동 거리 측정"""
+    print(f"\n  ▶ 전진 {duration}초 시작...")
+    left(1); right(1)
+    time.sleep(duration)
+    stop()
+    dist = input("  → 실측 이동 거리 (cm): ")
+    try:
+        cm = float(dist)
+        speed = cm / duration
+        print(f"  → 속도: {speed:.1f} cm/s")
+        print(f"  → 10cm 이동에 필요한 시간: {10/speed:.2f}초")
+        print(f"  → 50cm 이동에 필요한 시간: {50/speed:.2f}초")
+    except ValueError:
+        pass
+
+
+def test_reverse(duration):
+    """후진 테스트 → 이동 거리 측정"""
+    print(f"\n  ▶ 후진 {duration}초 시작...")
+    left(-1); right(-1)
+    time.sleep(duration)
+    stop()
+    dist = input("  → 실측 이동 거리 (cm): ")
+    try:
+        cm = float(dist)
+        speed = cm / duration
+        print(f"  → 후진 속도: {speed:.1f} cm/s")
+        print(f"  → EXIT_REVERSE_T 추천값 (30cm 후진): {30/speed:.2f}초")
+    except ValueError:
+        pass
+
+
+def test_rotation(duration):
+    """제자리 좌회전 테스트 → 회전 각도 측정"""
+    print(f"\n  ▶ 제자리 좌회전 {duration}초 시작...")
+    left(-1); right(1)
+    time.sleep(duration)
+    stop()
+    angle = input("  → 실측 회전 각도 (도): ")
+    try:
+        deg = float(angle)
+        rate = deg / duration
+        print(f"  → 회전 속도: {rate:.1f} deg/s")
+        print(f"  → 90° 회전에 필요한 시간: {90/rate:.2f}초")
+        print(f"  → TURN_DURATION 추천값 (90°): {90/rate:.2f}초")
+    except ValueError:
+        pass
+
+
+# ── 메인 메뉴 ──
+print("=" * 55)
+print("  모터 이동거리 / 회전각도 캘리브레이션")
+print("=" * 55)
+
+while True:
+    print("\n  [1] 전진 거리 측정")
+    print("  [2] 후진 거리 측정")
+    print("  [3] 회전 각도 측정")
+    print("  [q] 종료")
+    choice = input("  선택: ").strip()
+
+    if choice == 'q':
+        break
+    elif choice in ('1', '2', '3'):
+        t = input("  구동 시간 (초, 기본 1.0): ").strip()
+        duration = float(t) if t else 1.0
+        if choice == '1':
+            test_straight(duration)
+        elif choice == '2':
+            test_reverse(duration)
+        elif choice == '3':
+            test_rotation(duration)
+
+print("\n>>> 캘리브레이션 종료")
+cleanup()
